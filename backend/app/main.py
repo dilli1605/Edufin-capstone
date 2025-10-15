@@ -1,6 +1,9 @@
 from fastapi import FastAPI, HTTPException, Depends
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
+from .services.stock_service import real_time_stock_service
+import asyncio
+from fastapi import WebSocket, WebSocketDisconnect
 import json
 from datetime import datetime, timedelta
 import logging
@@ -50,6 +53,228 @@ MOCK_STOCKS = {
     "META": {"name": "Meta Platforms Inc.", "price": 485.75, "change": 3.45, "change_percent": 0.72},
     "NVDA": {"name": "NVIDIA Corporation", "price": 118.11, "change": -1.25, "change_percent": -1.05}
 }
+# Real-time Stock Data Endpoints
+@app.get("/api/stocks/price/{symbol}")
+async def get_real_time_price(symbol: str):
+    """Get real-time stock price with enhanced data"""
+    try:
+        price_data = await real_time_stock_service.get_real_time_price(symbol)
+        if not price_data:
+            raise HTTPException(status_code=404, detail="Stock not found")
+        return price_data
+    except Exception as e:
+        logger.error(f"Real-time price error for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching price data")
+
+@app.get("/api/stocks/chart/{symbol}")
+async def get_stock_chart(symbol: str, period: str = "1D"):
+    """Get chart data for different time periods"""
+    try:
+        valid_periods = ["1D", "1W", "1M", "3M", "1Y"]
+        if period not in valid_periods:
+            period = "1D"
+        
+        chart_data = await real_time_stock_service.get_chart_data(symbol, period)
+        return chart_data
+    except Exception as e:
+        logger.error(f"Chart data error for {symbol}: {e}")
+        raise HTTPException(status_code=500, detail="Error fetching chart data")
+
+@app.get("/api/stocks/search")
+async def search_stocks(query: str):
+    """Search for stocks by symbol or name"""
+    try:
+        if len(query) < 2:
+            return []
+        
+        results = await real_time_stock_service.search_stocks(query)
+        return results
+    except Exception as e:
+        logger.error(f"Stock search error: {e}")
+        return []
+
+@app.get("/api/market/status")
+async def get_market_status():
+    """Get current market status"""
+    try:
+        status = await real_time_stock_service.get_market_status()
+        return status
+    except Exception as e:
+        logger.error(f"Market status error: {e}")
+        return {"is_open": False, "status": "UNKNOWN", "timestamp": datetime.now().isoformat()}
+
+# Enhanced Trading Endpoints
+@app.post("/api/simulation/trade/v2")
+async def execute_trade_v2(
+    trade_data: dict,
+    db: Session = Depends(get_db), 
+    current_user: User = Depends(get_current_user)
+):
+    """Enhanced trade execution with real-time price validation"""
+    try:
+        symbol = trade_data.get("symbol", "").upper()
+        action = trade_data.get("action", "").upper()
+        quantity = trade_data.get("quantity", 0)
+        price = trade_data.get("price", 0.0)
+        
+        if not symbol or action not in ["BUY", "SELL"] or quantity <= 0:
+            raise HTTPException(status_code=400, detail="Invalid trade parameters")
+        
+        portfolio = db.query(Portfolio).filter(Portfolio.user_id == current_user.id).first()
+        if not portfolio:
+            raise HTTPException(status_code=404, detail="Portfolio not found")
+        
+        # Get real-time price for validation
+        real_time_data = await real_time_stock_service.get_real_time_price(symbol)
+        current_price = real_time_data["price"]
+        
+        # Price validation (allow 2% deviation from real-time price)
+        price_deviation = abs(price - current_price) / current_price
+        if price_deviation > 0.02:
+            logger.warning(f"Price deviation detected: {price} vs {current_price} for {symbol}")
+        
+        total_amount = current_price * quantity
+        
+        if action == "BUY":
+            if portfolio.virtual_cash < total_amount:
+                raise HTTPException(status_code=400, detail="Insufficient funds")
+            
+            portfolio.virtual_cash -= total_amount
+            
+            # Update or create holding
+            holding = db.query(Holding).filter(
+                Holding.portfolio_id == portfolio.id, 
+                Holding.symbol == symbol
+            ).first()
+            
+            if holding:
+                # Update average price using weighted average
+                total_shares = holding.quantity + quantity
+                total_cost = (holding.avg_price * holding.quantity) + total_amount
+                holding.avg_price = total_cost / total_shares
+                holding.quantity = total_shares
+            else:
+                holding = Holding(
+                    portfolio_id=portfolio.id,
+                    symbol=symbol,
+                    quantity=quantity,
+                    avg_price=current_price
+                )
+                db.add(holding)
+            
+        elif action == "SELL":
+            holding = db.query(Holding).filter(
+                Holding.portfolio_id == portfolio.id,
+                Holding.symbol == symbol
+            ).first()
+            
+            if not holding or holding.quantity < quantity:
+                raise HTTPException(status_code=400, detail="Insufficient shares")
+            
+            portfolio.virtual_cash += total_amount
+            holding.quantity -= quantity
+            
+            if holding.quantity == 0:
+                db.delete(holding)
+        
+        # Record transaction with real-time price
+        transaction = Transaction(
+            portfolio_id=portfolio.id,
+            symbol=symbol,
+            action=action,
+            quantity=quantity,
+            price=current_price,  # Use real-time price
+            total_amount=total_amount
+        )
+        db.add(transaction)
+        db.commit()
+        
+        # Update portfolio data
+        updated_portfolio = await get_portfolio(db, current_user)
+        
+        return {
+            "message": f"Successfully {action.lower()}ed {quantity} shares of {symbol}",
+            "action": action,
+            "symbol": symbol,
+            "quantity": quantity,
+            "executed_price": current_price,
+            "total_amount": total_amount,
+            "remaining_cash": round(portfolio.virtual_cash, 2),
+            "portfolio": updated_portfolio,
+            "success": True,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Enhanced trade execution error: {e}")
+        db.rollback()
+        raise HTTPException(status_code=500, detail="Trade execution failed")
+
+# Real-time Portfolio Streaming Endpoint
+@app.websocket("/api/ws/portfolio/{user_id}")
+async def websocket_portfolio(websocket: WebSocket, user_id: int):
+    """WebSocket for real-time portfolio updates"""
+    await websocket.accept()
+    try:
+        while True:
+            # Send portfolio updates every 10 seconds
+            await asyncio.sleep(10)
+            
+            # Get current portfolio data (simplified - you'd want proper user validation)
+            portfolio_data = {
+                "type": "portfolio_update",
+                "timestamp": datetime.now().isoformat(),
+                "message": "Portfolio update"
+            }
+            
+            await websocket.send_json(portfolio_data)
+            
+    except WebSocketDisconnect:
+        logger.info("WebSocket disconnected")
+    except Exception as e:
+        logger.error(f"WebSocket error: {e}")
+        await websocket.close()
+
+# Enhanced Market Data Endpoint
+@app.get("/api/market/overview/v2")
+async def get_market_overview_v2():
+    """Enhanced market overview with real-time data"""
+    try:
+        popular_symbols = ["AAPL", "GOOGL", "MSFT", "TSLA", "AMZN", "META", "NVDA", "SPY"]
+        
+        # Fetch all prices concurrently
+        price_tasks = [
+            real_time_stock_service.get_real_time_price(symbol) 
+            for symbol in popular_symbols
+        ]
+        prices = await asyncio.gather(*price_tasks, return_exceptions=True)
+        
+        market_data = []
+        for symbol, price_data in zip(popular_symbols, prices):
+            if isinstance(price_data, dict):
+                market_data.append(price_data)
+        
+        # Calculate market sentiment
+        gainers = len([p for p in market_data if p.get('change', 0) > 0])
+        losers = len([p for p in market_data if p.get('change', 0) < 0])
+        
+        return {
+            "market_data": market_data,
+            "market_summary": {
+                "total_symbols": len(market_data),
+                "gainers": gainers,
+                "losers": losers,
+                "neutral": len(market_data) - gainers - losers,
+                "sentiment": "BULLISH" if gainers > losers else "BEARISH" if losers > gainers else "NEUTRAL"
+            },
+            "timestamp": datetime.now().isoformat()
+        }
+        
+    except Exception as e:
+        logger.error(f"Enhanced market overview error: {e}")
+        return await get_market_overview()
 
 @app.get("/")
 async def root():
